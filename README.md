@@ -11,6 +11,10 @@ The plugin also exposes a `Streaming Enabled` switch child device that maps to
 the Home Assistant ABB Welcome streaming switch. Turn it on from Scrypted or
 HomeKit when you want to manually arm streaming for testing.
 
+Only the primary `front-door` child exposes plugin settings. Secondary stations
+are published without the global settings panel so they do not show the primary
+device name.
+
 Each Scrypted doorbell device provides:
 
 - `VideoCamera`: returns the HA-provided RTSP stream.

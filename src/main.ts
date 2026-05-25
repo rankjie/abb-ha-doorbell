@@ -708,6 +708,37 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         await this.deviceForNativeId(_nativeId).stopIntercom();
     }
 
+    private doorbellInterfaces(nativeId: string): ScryptedInterface[] {
+        const interfaces = [
+            ScryptedInterface.VideoCamera,
+            ScryptedInterface.Camera,
+            ScryptedInterface.Intercom,
+            ScryptedInterface.BinarySensor,
+        ];
+        if (nativeId === NATIVE_ID)
+            interfaces.push(ScryptedInterface.Settings);
+        return interfaces;
+    }
+
+    private updateVisibleDeviceName(nativeId: string, name: string): void {
+        try {
+            const state = sdk.deviceManager.getDeviceState(nativeId);
+            state.providedName = name;
+            const current = String(state.name || '').trim();
+            const globalName = this.getSetting('deviceName').trim() || 'Front Door';
+            if (
+                !current
+                || /^GATEWAY\s+/i.test(current)
+                || (nativeId !== NATIVE_ID && (current === globalName || current === 'Front Door'))
+            ) {
+                state.name = name;
+            }
+        }
+        catch (e) {
+            this.console.warn(`failed to update device name for ${nativeId}`, e);
+        }
+    }
+
     async syncDevice(): Promise<void> {
         const configuredName = this.getSetting('deviceName');
         let config: AutoConfig | undefined;
@@ -733,13 +764,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 nativeId,
                 name,
                 type: ScryptedDeviceType.Doorbell,
-                interfaces: [
-                    ScryptedInterface.VideoCamera,
-                    ScryptedInterface.Camera,
-                    ScryptedInterface.Intercom,
-                    ScryptedInterface.BinarySensor,
-                    ScryptedInterface.Settings,
-                ],
+                interfaces: this.doorbellInterfaces(nativeId),
                 info: {
                     manufacturer: 'ABB',
                     model: 'Welcome via Home Assistant',
@@ -755,13 +780,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 nativeId: NATIVE_ID,
                 name: configuredName || 'Front Door',
                 type: ScryptedDeviceType.Doorbell,
-                interfaces: [
-                    ScryptedInterface.VideoCamera,
-                    ScryptedInterface.Camera,
-                    ScryptedInterface.Intercom,
-                    ScryptedInterface.BinarySensor,
-                    ScryptedInterface.Settings,
-                ],
+                interfaces: this.doorbellInterfaces(NATIVE_ID),
                 info: {
                     manufacturer: 'ABB',
                     model: 'Welcome via Home Assistant',
@@ -791,6 +810,8 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         await sdk.deviceManager.onDevicesChanged({
             devices,
         });
+        for (const device of devices)
+            this.updateVisibleDeviceName(device.nativeId, device.name);
     }
 
     deviceName(nativeId: string): string {
