@@ -71,6 +71,8 @@ type SettingKey =
     | 'stationId'
     | 'pollIntervalMs'
     | 'talkChunkMs'
+    | 'appleHomeHubPresent'
+    | 'blockAppleHomeHubPreview'
     | 'ringPreviewBlockSeconds'
     | 'blockedHomeKitClientIds';
 
@@ -292,6 +294,17 @@ function settingList(value: unknown): string[] {
         .filter(Boolean);
 }
 
+function settingBoolean(value: unknown): boolean {
+    value = stateValue(value);
+    if (typeof value === 'boolean')
+        return value;
+    if (typeof value === 'number')
+        return value !== 0;
+    if (typeof value === 'string')
+        return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+    return false;
+}
+
 function normalizeHomeKitClientId(value: unknown): string {
     return String(value || '').trim().replace(/^::ffff:/, '').toLowerCase();
 }
@@ -340,6 +353,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         if (value !== undefined && value !== null)
             return value;
 
+        const existingBlockedClients = settingList(this.storage.getItem('blockedHomeKitClientIds')).length > 0;
         const defaults: Record<SettingKey, string> = {
             deviceName: 'Front Door',
             haBaseUrl: '',
@@ -352,6 +366,8 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             stationId: '',
             pollIntervalMs: '750',
             talkChunkMs: '100',
+            appleHomeHubPresent: existingBlockedClients ? 'true' : 'false',
+            blockAppleHomeHubPreview: existingBlockedClients ? 'true' : 'false',
             ringPreviewBlockSeconds: String(DEFAULT_RING_PREVIEW_BLOCK_SECONDS),
             blockedHomeKitClientIds: '',
         };
@@ -499,22 +515,48 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 range: [40, 250],
             },
             {
-                key: 'ringPreviewBlockSeconds',
-                title: 'Ring Preview Block Window',
-                group: 'Advanced Overrides',
-                type: 'integer',
-                value: Number(this.getSetting('ringPreviewBlockSeconds')) || DEFAULT_RING_PREVIEW_BLOCK_SECONDS,
-                range: [0, 180],
-                description: 'Seconds after a ring event during which blocked HomeKit clients may not auto-open the intercom stream.',
+                key: 'appleHomeHubPresent',
+                title: 'Apple TV / Home Hub Present',
+                group: 'HomeKit Pickup Safety',
+                type: 'boolean',
+                value: this.appleHomeHubPresent(),
+                description: 'Enable this if Apple Home uses an Apple TV or HomePod as a Home Hub.',
+            },
+            {
+                key: 'appleHomeHubNotice',
+                title: 'Apple TV Preview Warning',
+                group: 'HomeKit Pickup Safety',
+                type: 'html',
+                readonly: true,
+                value: this.appleHomeHubPresent()
+                    ? 'Apple TV and some Home Hubs may open a local doorbell preview immediately after a ring. ABB Welcome calls are exclusive, so this can occupy the intercom before a person answers. If you use this safety mode, assign the hub a fixed LAN IP, enter it below, and keep Scrypted Rebroadcast/Prebuffer disabled for these doorbells.'
+                    : 'Leave this off if this Apple Home has no Apple TV/Home Hub. If you add one later, enable this section and enter its fixed LAN IP if ring previews auto-open the intercom.',
+            },
+            {
+                key: 'blockAppleHomeHubPreview',
+                title: 'Block Apple TV Preview Pickup',
+                group: 'HomeKit Pickup Safety',
+                type: 'boolean',
+                value: this.blockAppleHomeHubPreviewSetting(),
+                description: 'Reject matching local HomeKit preview streams during a ring. Manual Home app viewing and remote viewing through the Home Hub remain allowed.',
             },
             {
                 key: 'blockedHomeKitClientIds',
-                title: 'Blocked HomeKit Client IPs',
-                group: 'Advanced Overrides',
+                title: 'Apple TV / Home Hub IPs',
+                group: 'HomeKit Pickup Safety',
                 type: 'string',
                 value: this.getSetting('blockedHomeKitClientIds'),
                 placeholder: '192.168.1.50, 192.168.1.51',
-                description: 'Comma-separated HomeKit destinationId values, usually Apple TV/HomePod IPs, to reject during the ring preview window.',
+                description: 'Comma-separated fixed LAN IPs reported as HomeKit destinationId. Leave blank to disable preview blocking.',
+            },
+            {
+                key: 'ringPreviewBlockSeconds',
+                title: 'Ring Preview Block Window',
+                group: 'HomeKit Pickup Safety',
+                type: 'integer',
+                value: Number(this.getSetting('ringPreviewBlockSeconds')) || DEFAULT_RING_PREVIEW_BLOCK_SECONDS,
+                range: [0, 180],
+                description: 'Seconds after a ring event during which the listed Apple TV/Home Hub IPs may not auto-open the intercom stream.',
             },
         ];
     }
@@ -1121,7 +1163,21 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         await this.callHaService('switch', 'turn_on', { entity_id: entityId });
     }
 
+    appleHomeHubPresent(): boolean {
+        return settingBoolean(this.getSetting('appleHomeHubPresent'));
+    }
+
+    blockAppleHomeHubPreviewSetting(): boolean {
+        return settingBoolean(this.getSetting('blockAppleHomeHubPreview'));
+    }
+
+    blockAppleHomeHubPreview(): boolean {
+        return this.appleHomeHubPresent() && this.blockAppleHomeHubPreviewSetting();
+    }
+
     blockedHomeKitClientIds(): Set<string> {
+        if (!this.blockAppleHomeHubPreview())
+            return new Set();
         return new Set(
             settingList(this.getSetting('blockedHomeKitClientIds'))
                 .map(normalizeHomeKitClientId)
