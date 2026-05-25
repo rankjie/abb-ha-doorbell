@@ -503,6 +503,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 type: 'subscribe_events',
                 event_type: HA_DISCOVERY_EVENT,
             }));
+            await this.handleHaDiscoveryChanged({ reason: 'websocket_connected' });
             return;
         }
 
