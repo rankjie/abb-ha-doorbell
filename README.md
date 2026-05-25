@@ -18,7 +18,7 @@ device name.
 Each Scrypted doorbell device provides:
 
 - `VideoCamera`: returns the HA-provided RTSP stream.
-- `Camera`: returns the latest HA doorbell screenshot for HomeKit previews without opening the live intercom stream.
+- `Camera`: returns the matching HA camera snapshot for HomeKit previews without opening the live intercom stream.
 - `BinarySensor`: mirrors the HA ring sensor for HomeKit doorbell notifications.
 - `Intercom`: receives HomeKit/Scrypted microphone audio, converts it to 8 kHz mono PCM16LE, and sends it to the HA talkback services.
 
@@ -54,3 +54,9 @@ rtsp://<home-assistant-lan-ip>:18556/abb_100000001
 
 The HA-native HomeKit bridge can still be used for a one-way camera. Use this
 Scrypted bridge when HomeKit needs the microphone/intercom path.
+
+When a Scrypted doorbell is added to the Scrypted HomeKit plugin, this plugin
+automatically enables HomeKit's `Transcode Video` and `Transcode Audio` debug
+mode for that doorbell. ABB Welcome streams use PCMA/G.711 audio and H.264 RTP
+that HomeKit does not reliably accept as passthrough, so transcoding is required
+for stable live view and audio in the Home app.

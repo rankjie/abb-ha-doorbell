@@ -30,6 +30,10 @@ const DEVICE_REFRESH_VERSION = '2026-05-25-multi-station-media-ids';
 const HA_DISCOVERY_EVENT = 'abb_welcome_discovery_changed';
 const HA_RING_EVENT = 'abb_welcome_ring';
 const RING_EVENT_DURATION_MS = 30000;
+const HOMEKIT_MIXIN_INTERFACE = 'mixin:@scrypted/homekit';
+const HOMEKIT_DEBUG_MODE_KEY = 'homekit:debugMode';
+const REQUIRED_HOMEKIT_DEBUG_MODE = ['Transcode Video', 'Transcode Audio'];
+const HOMEKIT_TRANSCODING_ENSURE_DELAY_MS = 5000;
 const FALLBACK_JPEG = Buffer.from(
     '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Al//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8QH//EFBABAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z',
     'base64',
@@ -165,6 +169,22 @@ function cleanCameraName(name: string): string {
         .replace(/^GATEWAY\s*/i, '')
         .replace(/\s+Camera$/i, '')
         .trim() || name || 'ABB Door';
+}
+
+function settingStringArray(value: unknown): string[] {
+    if (Array.isArray(value))
+        return value.map(item => String(item));
+    if (typeof value === 'string') {
+        try {
+            const parsed = JSON.parse(value);
+            if (Array.isArray(parsed))
+                return parsed.map(item => String(item));
+        }
+        catch {
+            return value ? [value] : [];
+        }
+    }
+    return [];
 }
 
 class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, Settings {
@@ -839,6 +859,39 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             this.storage.setItem('deviceRefreshVersion', DEVICE_REFRESH_VERSION);
         for (const device of devices)
             this.updateVisibleDeviceName(device.nativeId, device.name);
+        for (const device of devices) {
+            if (device.type !== ScryptedDeviceType.Doorbell)
+                continue;
+            this.ensureHomeKitTranscoding(device.nativeId)
+                .catch(e => this.console.warn(`HomeKit transcode setup failed for ${device.name}`, e));
+            setTimeout(() => {
+                this.ensureHomeKitTranscoding(device.nativeId)
+                    .catch(e => this.console.warn(`delayed HomeKit transcode setup failed for ${device.name}`, e));
+            }, HOMEKIT_TRANSCODING_ENSURE_DELAY_MS);
+        }
+    }
+
+    private async ensureHomeKitTranscoding(nativeId: string): Promise<void> {
+        const state = sdk.deviceManager.getDeviceState(nativeId);
+        if (!state.id || !Array.isArray(state.interfaces) || !state.interfaces.includes(HOMEKIT_MIXIN_INTERFACE))
+            return;
+
+        const device = sdk.systemManager.getDeviceById(state.id) as any;
+        if (!device?.getSettings || !device?.putSetting)
+            return;
+
+        const settings = await device.getSettings();
+        const debugMode = settings.find((setting: Setting) => setting.key === HOMEKIT_DEBUG_MODE_KEY);
+        if (!debugMode)
+            return;
+
+        const current = settingStringArray(debugMode.value);
+        if (REQUIRED_HOMEKIT_DEBUG_MODE.every(item => current.includes(item)))
+            return;
+
+        const next = Array.from(new Set([...REQUIRED_HOMEKIT_DEBUG_MODE, ...current]));
+        await device.putSetting(HOMEKIT_DEBUG_MODE_KEY, next);
+        this.console.log(`enabled HomeKit video/audio transcoding for ${this.deviceName(nativeId)}`);
     }
 
     deviceName(nativeId: string): string {
