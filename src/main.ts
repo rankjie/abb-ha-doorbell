@@ -34,6 +34,8 @@ const HOMEKIT_MIXIN_INTERFACE = 'mixin:@scrypted/homekit';
 const HOMEKIT_DEBUG_MODE_KEY = 'homekit:debugMode';
 const REQUIRED_HOMEKIT_DEBUG_MODE = ['Transcode Video', 'Transcode Audio'];
 const HOMEKIT_TRANSCODING_ENSURE_DELAY_MS = 5000;
+const REBROADCAST_PLUGIN_ID = '@scrypted/prebuffer-mixin';
+const REBROADCAST_MIXIN_INTERFACE = 'mixin:@scrypted/prebuffer-mixin';
 const FALLBACK_JPEG = Buffer.from(
     '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Al//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8QH//EFBABAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z',
     'base64',
@@ -100,6 +102,12 @@ function settingString(value: SettingValue): string {
     if (value === undefined || value === null)
         return '';
     return String(value);
+}
+
+function stateValue(value: any): any {
+    if (value && typeof value === 'object' && 'value' in value)
+        return value.value;
+    return value;
 }
 
 function isValidRtspUrl(value: unknown): value is string {
@@ -172,6 +180,7 @@ function cleanCameraName(name: string): string {
 }
 
 function settingStringArray(value: unknown): string[] {
+    value = stateValue(value);
     if (Array.isArray(value))
         return value.map(item => String(item));
     if (typeof value === 'string') {
@@ -862,21 +871,27 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         for (const device of devices) {
             if (device.type !== ScryptedDeviceType.Doorbell)
                 continue;
-            this.ensureHomeKitTranscoding(device.nativeId)
-                .catch(e => this.console.warn(`HomeKit transcode setup failed for ${device.name}`, e));
+            this.ensureDoorbellScryptedDefaults(device.nativeId)
+                .catch(e => this.console.warn(`Scrypted default setup failed for ${device.name}`, e));
             setTimeout(() => {
-                this.ensureHomeKitTranscoding(device.nativeId)
-                    .catch(e => this.console.warn(`delayed HomeKit transcode setup failed for ${device.name}`, e));
+                this.ensureDoorbellScryptedDefaults(device.nativeId)
+                    .catch(e => this.console.warn(`delayed Scrypted default setup failed for ${device.name}`, e));
             }, HOMEKIT_TRANSCODING_ENSURE_DELAY_MS);
         }
     }
 
+    private async ensureDoorbellScryptedDefaults(nativeId: string): Promise<void> {
+        await this.ensureHomeKitTranscoding(nativeId);
+        await this.ensureNoRebroadcastMixin(nativeId);
+    }
+
     private async ensureHomeKitTranscoding(nativeId: string): Promise<void> {
         const state = sdk.deviceManager.getDeviceState(nativeId);
-        if (!state.id || !Array.isArray(state.interfaces) || !state.interfaces.includes(HOMEKIT_MIXIN_INTERFACE))
+        const interfaces = settingStringArray((state as any).interfaces);
+        if (!state.id || !interfaces.includes(HOMEKIT_MIXIN_INTERFACE))
             return;
 
-        const device = sdk.systemManager.getDeviceById(state.id) as any;
+        const device = sdk.systemManager.getDeviceById(stateValue(state.id)) as any;
         if (!device?.getSettings || !device?.putSetting)
             return;
 
@@ -892,6 +907,33 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         const next = Array.from(new Set([...REQUIRED_HOMEKIT_DEBUG_MODE, ...current]));
         await device.putSetting(HOMEKIT_DEBUG_MODE_KEY, next);
         this.console.log(`enabled HomeKit video/audio transcoding for ${this.deviceName(nativeId)}`);
+    }
+
+    private async ensureNoRebroadcastMixin(nativeId: string): Promise<void> {
+        const state = sdk.deviceManager.getDeviceState(nativeId);
+        const interfaces = settingStringArray((state as any).interfaces);
+        if (!interfaces.includes(REBROADCAST_MIXIN_INTERFACE))
+            return;
+
+        const device = sdk.systemManager.getDeviceById(stateValue(state.id)) as any;
+        if (!device?.setMixins)
+            return;
+
+        const mixins = settingStringArray((state as any).mixins || device.mixins);
+        const filtered: string[] = [];
+        for (const mixinId of mixins) {
+            const mixinDevice = sdk.systemManager.getDeviceById(mixinId) as any;
+            const pluginId = String(stateValue(mixinDevice?.pluginId) || '');
+            if (pluginId === REBROADCAST_PLUGIN_ID)
+                continue;
+            filtered.push(mixinId);
+        }
+
+        if (filtered.length === mixins.length)
+            return;
+
+        await device.setMixins(filtered);
+        this.console.log(`removed Rebroadcast prebuffer from ${this.deviceName(nativeId)}`);
     }
 
     deviceName(nativeId: string): string {

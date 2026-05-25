@@ -60,3 +60,8 @@ automatically enables HomeKit's `Transcode Video` and `Transcode Audio` debug
 mode for that doorbell. ABB Welcome streams use PCMA/G.711 audio and H.264 RTP
 that HomeKit does not reliably accept as passthrough, so transcoding is required
 for stable live view and audio in the Home app.
+
+The plugin also removes Scrypted Rebroadcast/Prebuffer from ABB doorbells when
+it is present. ABB Welcome streaming is an exclusive, on-demand intercom call;
+prebuffering can keep the building intercom occupied and can delay HomeKit live
+view while it waits for a sync frame.
