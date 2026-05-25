@@ -1,8 +1,9 @@
 # ABB HA Doorbell for Scrypted
 
 Scrypted bridge for the [ABB Welcome Home Assistant integration][ha-integration].
-Use this plugin when Apple Home needs a HomeKit doorbell with live video,
-doorbell notifications, and two-way audio.
+Add the Scrypted doorbells from this plugin to Apple Home to turn ABB Welcome
+stations into full HomeKit doorbells with live video, doorbell notifications,
+and two-way audio.
 
 The [Home Assistant integration][ha-integration] remains responsible for ABB
 pairing, SIP, RTP, RTSP, talkback, and door opening. This plugin is the
