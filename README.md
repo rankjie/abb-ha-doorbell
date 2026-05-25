@@ -18,7 +18,7 @@ device name.
 Each Scrypted doorbell device provides:
 
 - `VideoCamera`: returns the HA-provided RTSP stream.
-- `Camera`: returns the matching HA camera snapshot for HomeKit previews without opening the live intercom stream.
+- `Camera`: returns the matching HA camera snapshot for HomeKit previews without opening the live intercom stream. The global HA `latest_screenshot` image is not used because it is not station-specific in multi-door setups.
 - `BinarySensor`: mirrors the HA ring sensor for HomeKit doorbell notifications.
 - `Intercom`: receives HomeKit/Scrypted microphone audio, converts it to 8 kHz mono PCM16LE, and sends it to the HA talkback services.
 
