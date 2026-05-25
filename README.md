@@ -2,7 +2,12 @@
 
 Scrypted bridge for the ABB Welcome Home Assistant custom integration.
 
-The plugin exposes one Scrypted `Doorbell` device with:
+The plugin exposes one Scrypted `Doorbell` device for each ABB Welcome camera
+entity discovered in Home Assistant. The legacy `front-door` native id is kept
+for the primary/first station so existing HomeKit pairings do not get replaced.
+Additional stations are added as separate Scrypted child devices.
+
+Each Scrypted doorbell device provides:
 
 - `VideoCamera`: returns the HA-provided RTSP stream.
 - `Camera`: returns the latest HA doorbell screenshot for HomeKit previews without opening the live intercom stream.
@@ -19,10 +24,11 @@ In normal use, configure only:
 - Home Assistant long-lived access token
 
 The plugin discovers ABB Welcome camera entities, the streaming switch, ring
-sensor, snapshot image entity, station id, and HA's `lan_rtsp_url`
-automatically. Leave **Door Station** blank to use the first unlock-capable
-station, or pick one from the discovered list. Use **Refresh Discovery** after
-adding, removing, or renaming ABB Welcome stations in Home Assistant.
+sensor, snapshot image entity, station ids, and HA's `lan_rtsp_url`
+automatically. Leave **Primary Door Station** blank to keep the first
+unlock-capable station on the existing `front-door` device, or pick a different
+primary station. Use **Refresh Discovery** after adding, removing, or renaming
+ABB Welcome stations in Home Assistant.
 
 The plugin re-reads Home Assistant discovery before starting a new stream, so if
 the HA integration reloads and moves its LAN RTSP proxy to a different free

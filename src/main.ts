@@ -25,6 +25,8 @@ const WebSocket = require('ws');
 const NATIVE_ID = 'front-door';
 const AUTO_DISCOVERY_TTL_MS = 30_000;
 const HA_DISCOVERY_EVENT = 'abb_welcome_discovery_changed';
+const HA_RING_EVENT = 'abb_welcome_ring';
+const RING_EVENT_DURATION_MS = 30000;
 const FALLBACK_JPEG = Buffer.from(
     '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Al//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8QH//EFBABAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z',
     'base64',
@@ -141,8 +143,28 @@ function htmlEscape(value: string): string {
         .replace(/"/g, '&quot;');
 }
 
+function nativeIdSlug(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'unknown';
+}
+
+function cameraNativeId(camera: DiscoveredCamera, primaryEntityId: string): string {
+    if (camera.entityId === primaryEntityId)
+        return NATIVE_ID;
+    if (camera.stationId)
+        return `station-${nativeIdSlug(camera.stationId)}`;
+    return `entity-${nativeIdSlug(camera.entityId)}`;
+}
+
+function cleanCameraName(name: string): string {
+    return name
+        .replace(/^ABB Welcome\s*/i, '')
+        .replace(/\s+Camera$/i, '')
+        .trim() || name || 'ABB Door';
+}
+
 class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, Settings {
-    private doorbell: AbbDoorbell;
+    private doorbells = new Map<string, AbbDoorbell>();
+    private deviceNames = new Map<string, string>();
     private pollTimer?: NodeJS.Timeout;
     private lastPollWarning = 0;
     private autoConfig?: AutoConfig;
@@ -155,13 +177,22 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
 
     constructor() {
         super();
-        this.doorbell = new AbbDoorbell(this, NATIVE_ID);
+        this.deviceForNativeId(NATIVE_ID);
         this.syncDevice()
             .then(() => {
                 this.restartPolling();
                 this.restartHaEventSocket();
             })
             .catch(e => this.console.error('device sync failed', e));
+    }
+
+    private deviceForNativeId(nativeId: string): AbbDoorbell {
+        let doorbell = this.doorbells.get(nativeId);
+        if (!doorbell) {
+            doorbell = new AbbDoorbell(this, nativeId);
+            this.doorbells.set(nativeId, doorbell);
+        }
+        return doorbell;
     }
 
     getSetting(key: SettingKey): string {
@@ -189,6 +220,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         if (key === 'refreshDiscovery') {
             this.clearAutoConfig();
             await this.getAutoConfig();
+            await this.syncDevice();
             this.restartPolling();
             return;
         }
@@ -207,6 +239,8 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         ].includes(key)) {
             this.clearAutoConfig();
         }
+        if (key === 'cameraEntityId')
+            await this.syncDevice();
         if (key === 'haBaseUrl' || key === 'haToken')
             this.restartHaEventSocket();
         if (key === 'pollIntervalMs' || key === 'haBaseUrl' || key === 'haToken' || key === 'ringSensorEntityId')
@@ -265,14 +299,14 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             },
             {
                 key: 'cameraEntityId',
-                title: 'Door Station',
+                title: 'Primary Door Station',
                 group: 'Doorbell',
                 type: 'string',
                 value: this.getSetting('cameraEntityId'),
                 choices: cameraChoices,
                 combobox: true,
                 placeholder: config?.cameraEntityId || 'Auto',
-                description: 'Leave blank to automatically use the first unlock-capable ABB Welcome camera. Use Refresh Discovery after changing stations in Home Assistant.',
+                description: 'Leave blank to keep the first unlock-capable ABB Welcome camera on the existing front-door device. Other discovered stations are exposed as additional doorbells.',
             },
             {
                 key: 'imageEntityId',
@@ -497,12 +531,14 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         }
 
         if (payload.type === 'auth_ok') {
-            const id = ++this.haEventSocketSubscribeId;
-            socket.send(JSON.stringify({
-                id,
-                type: 'subscribe_events',
-                event_type: HA_DISCOVERY_EVENT,
-            }));
+            for (const eventType of [HA_DISCOVERY_EVENT, HA_RING_EVENT]) {
+                const id = ++this.haEventSocketSubscribeId;
+                socket.send(JSON.stringify({
+                    id,
+                    type: 'subscribe_events',
+                    event_type: eventType,
+                }));
+            }
             await this.handleHaDiscoveryChanged({ reason: 'websocket_connected' });
             return;
         }
@@ -515,14 +551,24 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         if (payload.type === 'event' && payload.event?.event_type === HA_DISCOVERY_EVENT) {
             await this.handleHaDiscoveryChanged(payload.event.data || {});
         }
+        if (payload.type === 'event' && payload.event?.event_type === HA_RING_EVENT) {
+            await this.handleHaRing(payload.event.data || {});
+        }
     }
 
     private async handleHaDiscoveryChanged(data: Record<string, any>): Promise<void> {
         this.console.log(`HA ABB discovery changed: ${data.reason || 'unknown'}`);
         this.clearAutoConfig();
         await this.getAutoConfig()
+            .then(() => this.syncDevice())
             .then(() => this.restartPolling())
             .catch(e => this.console.warn('HA discovery refresh after event failed', e));
+    }
+
+    private async handleHaRing(data: Record<string, any>): Promise<void> {
+        const stationId = String(data.station_id || data.caller_user || '').trim();
+        const nativeId = await this.nativeIdForStation(stationId);
+        this.deviceForNativeId(nativeId).triggerRing(RING_EVENT_DURATION_MS);
     }
 
     async getResolvedConfig(): Promise<AutoConfig> {
@@ -534,6 +580,32 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             stationId: manualStationId || auto.stationId,
             rtspUrl: manualRtspUrl || auto.rtspUrl,
         };
+    }
+
+    async getResolvedConfigForNativeId(nativeId: string): Promise<AutoConfig> {
+        if (nativeId === NATIVE_ID)
+            return this.getResolvedConfig();
+
+        const auto = await this.getAutoConfig();
+        const camera = auto.cameras.find(item => cameraNativeId(item, auto.cameraEntityId) === nativeId);
+        if (!camera)
+            throw new Error(`No ABB Welcome camera is mapped to Scrypted device ${nativeId}`);
+
+        const manualRtspUrl = this.getSetting('rtspUrl').trim();
+        return {
+            ...auto,
+            cameraEntityId: camera.entityId,
+            stationId: camera.stationId,
+            rtspUrl: camera.rtspUrl || manualRtspUrl || auto.rtspUrl,
+        };
+    }
+
+    private async nativeIdForStation(stationId: string): Promise<string> {
+        if (!stationId)
+            return NATIVE_ID;
+        const config = await this.getAutoConfig();
+        const camera = config.cameras.find(item => item.stationId === stationId);
+        return camera ? cameraNativeId(camera, config.cameraEntityId) : NATIVE_ID;
     }
 
     private async discoverAutoConfig(): Promise<AutoConfig> {
@@ -621,42 +693,88 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
     }
 
     async getDevice(nativeId: string): Promise<AbbDoorbell> {
-        if (nativeId !== NATIVE_ID)
-            throw new Error(`unknown ABB HA device: ${nativeId}`);
-        return this.doorbell;
+        return this.deviceForNativeId(nativeId);
     }
 
     async releaseDevice(_id: string, _nativeId: string): Promise<void> {
-        await this.doorbell.stopIntercom();
+        await this.deviceForNativeId(_nativeId).stopIntercom();
     }
 
     async syncDevice(): Promise<void> {
         const configuredName = this.getSetting('deviceName');
-        await sdk.deviceManager.onDevicesChanged({
-            devices: [
-                {
-                    nativeId: NATIVE_ID,
-                    name: configuredName || 'Front Door',
-                    type: ScryptedDeviceType.Doorbell,
-                    interfaces: [
-                        ScryptedInterface.VideoCamera,
-                        ScryptedInterface.Camera,
-                        ScryptedInterface.Intercom,
-                        ScryptedInterface.BinarySensor,
-                        ScryptedInterface.Settings,
-                    ],
-                    info: {
-                        manufacturer: 'ABB',
-                        model: 'Welcome via Home Assistant',
-                        ip: normalizeBaseUrl(this.getSetting('haBaseUrl')).replace(/^https?:\/\//, ''),
-                    },
+        let config: AutoConfig | undefined;
+        try {
+            if (this.getSetting('haBaseUrl') && this.getSetting('haToken'))
+                config = await this.getAutoConfig();
+        }
+        catch (e) {
+            this.console.warn('device discovery sync failed', e);
+        }
+
+        this.deviceNames.clear();
+        const cameras = config?.cameras.length ? config.cameras : [];
+        const devices = cameras.map(camera => {
+            const nativeId = cameraNativeId(camera, config!.cameraEntityId);
+            const defaultName = cleanCameraName(camera.name);
+            const name = nativeId === NATIVE_ID
+                ? (configuredName || defaultName || 'Front Door')
+                : defaultName;
+            this.deviceNames.set(nativeId, name);
+            this.deviceForNativeId(nativeId);
+            return {
+                nativeId,
+                name,
+                type: ScryptedDeviceType.Doorbell,
+                interfaces: [
+                    ScryptedInterface.VideoCamera,
+                    ScryptedInterface.Camera,
+                    ScryptedInterface.Intercom,
+                    ScryptedInterface.BinarySensor,
+                    ScryptedInterface.Settings,
+                ],
+                info: {
+                    manufacturer: 'ABB',
+                    model: 'Welcome via Home Assistant',
+                    ip: normalizeBaseUrl(this.getSetting('haBaseUrl')).replace(/^https?:\/\//, ''),
                 },
-            ],
+            };
+        });
+
+        if (!devices.length) {
+            this.deviceNames.set(NATIVE_ID, configuredName || 'Front Door');
+            this.deviceForNativeId(NATIVE_ID);
+            devices.push({
+                nativeId: NATIVE_ID,
+                name: configuredName || 'Front Door',
+                type: ScryptedDeviceType.Doorbell,
+                interfaces: [
+                    ScryptedInterface.VideoCamera,
+                    ScryptedInterface.Camera,
+                    ScryptedInterface.Intercom,
+                    ScryptedInterface.BinarySensor,
+                    ScryptedInterface.Settings,
+                ],
+                info: {
+                    manufacturer: 'ABB',
+                    model: 'Welcome via Home Assistant',
+                    ip: normalizeBaseUrl(this.getSetting('haBaseUrl')).replace(/^https?:\/\//, ''),
+                },
+            });
+        }
+
+        await sdk.deviceManager.onDevicesChanged({
+            devices,
         });
     }
 
-    async targetData(): Promise<Record<string, string>> {
-        const config = await this.getResolvedConfig();
+    deviceName(nativeId: string): string {
+        return this.deviceNames.get(nativeId)
+            || (nativeId === NATIVE_ID ? this.getSetting('deviceName') : '')
+            || 'ABB Door';
+    }
+
+    async targetData(nativeId = NATIVE_ID): Promise<Record<string, string>> {
+        const config = await this.getResolvedConfigForNativeId(nativeId);
         const data: Record<string, string> = {};
         const entityId = config.cameraEntityId;
         const stationId = config.stationId;
@@ -747,16 +865,17 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             return;
         const state = await this.callHa(`/api/states/${encodeURIComponent(entityId)}`);
         const next = state?.state === 'on';
-        this.doorbell.updateRingState(next);
+        this.deviceForNativeId(NATIVE_ID).updateRingState(next);
     }
 }
 
 class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Intercom, BinarySensor, Settings {
     private intercom?: IntercomSession;
     private sessionCounter = 0;
+    private ringClearTimer?: NodeJS.Timeout;
 
-    constructor(private provider: AbbDoorbellProvider, nativeId: string) {
-        super(nativeId);
+    constructor(private provider: AbbDoorbellProvider, private doorNativeId: string) {
+        super(doorNativeId);
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -786,10 +905,20 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
         }
     }
 
+    triggerRing(durationMs: number): void {
+        this.updateRingState(true);
+        if (this.ringClearTimer)
+            clearTimeout(this.ringClearTimer);
+        this.ringClearTimer = setTimeout(() => {
+            this.ringClearTimer = undefined;
+            this.updateRingState(false);
+        }, durationMs);
+    }
+
     private streamOptions(): ResponseMediaStreamOptions {
         return {
             id: 'main',
-            name: this.provider.getSetting('deviceName'),
+            name: this.provider.deviceName(this.doorNativeId),
             container: 'rtsp',
             tool: 'ffmpeg',
             source: 'local',
@@ -852,7 +981,7 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     }
 
     private async getRtspUrl(): Promise<string> {
-        const config = await this.provider.getResolvedConfig();
+        const config = await this.provider.getResolvedConfigForNativeId(this.doorNativeId);
         if (config.rtspUrl)
             return config.rtspUrl;
         throw new Error('ABB Welcome RTSP URL is not available yet. Reload the HA integration or refresh Scrypted discovery.');
@@ -874,7 +1003,7 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     }
 
     async takePicture(_options?: RequestPictureOptions): Promise<MediaObject> {
-        const config = await this.provider.getResolvedConfig();
+        const config = await this.provider.getResolvedConfigForNativeId(this.doorNativeId);
         const image = await this.fetchHaEntityPicture(config.imageEntityId)
             || await this.fetchHaEntityPicture(config.cameraEntityId)
             || FALLBACK_JPEG;
@@ -911,7 +1040,7 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
         const session: IntercomSession = {
             id: ++this.sessionCounter,
             process: undefined as any,
-            targetData: await this.provider.targetData(),
+            targetData: await this.provider.targetData(this.doorNativeId),
             buffer: Buffer.alloc(0),
             queue: [],
             sending: false,
