@@ -1,0 +1,11 @@
+{
+  "extends": "./node_modules/@scrypted/sdk/tsconfig.plugin.json",
+  "compilerOptions": {
+    "module": "Node16",
+    "noImplicitAny": false,
+    "skipLibCheck": true
+  },
+  "include": [
+    "src/**/*.ts"
+  ]
+}
