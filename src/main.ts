@@ -26,6 +26,7 @@ const WebSocket = require('ws');
 const NATIVE_ID = 'front-door';
 const STREAMING_SWITCH_NATIVE_ID = 'streaming-enabled';
 const AUTO_DISCOVERY_TTL_MS = 30_000;
+const DEVICE_REFRESH_VERSION = '2026-05-25-multi-station-media-ids';
 const HA_DISCOVERY_EVENT = 'abb_welcome_discovery_changed';
 const HA_RING_EVENT = 'abb_welcome_ring';
 const RING_EVENT_DURATION_MS = 30000;
@@ -69,6 +70,7 @@ interface DiscoveredCamera {
     name: string;
     stationId: string;
     rtspUrl: string;
+    imageEntityId: string;
 }
 
 interface IntercomSession {
@@ -596,9 +598,11 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             throw new Error(`No ABB Welcome camera is mapped to Scrypted device ${nativeId}`);
 
         const manualRtspUrl = this.getSetting('rtspUrl').trim();
+        const manualImageEntityId = this.getSetting('imageEntityId').trim();
         return {
             ...auto,
             cameraEntityId: camera.entityId,
+            imageEntityId: manualImageEntityId || camera.imageEntityId,
             stationId: camera.stationId,
             rtspUrl: camera.rtspUrl || manualRtspUrl || auto.rtspUrl,
         };
@@ -623,6 +627,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             name: friendlyName(state),
             stationId: stationIdFromCamera(state),
             rtspUrl: isValidRtspUrl(state.attributes?.lan_rtsp_url) ? state.attributes.lan_rtsp_url : '',
+            imageEntityId: this.findImageEntityForCamera(states, state)?.entity_id || '',
         }));
         const manualCamera = this.getSetting('cameraEntityId').trim();
         const camera = cameras.find(state => state.entity_id === manualCamera)
@@ -696,6 +701,22 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         return states.find(predicate);
     }
 
+    private findImageEntityForCamera(states: HaState[], camera: HaState): HaState | undefined {
+        const stationId = stationIdFromCamera(camera);
+        const cameraName = cleanCameraName(friendlyName(camera)).toLowerCase();
+        const cameraKey = camera.entity_id.replace(/^camera\./, '').toLowerCase();
+
+        return states.find(state => {
+            if (!isAbbEntity(state, 'image'))
+                return false;
+            const entityId = state.entity_id.toLowerCase();
+            const name = cleanCameraName(friendlyName(state)).toLowerCase();
+            return (stationId && entityId.includes(stationId.toLowerCase()))
+                || (cameraKey && entityId.includes(cameraKey))
+                || (cameraName && name.includes(cameraName));
+        });
+    }
+
     async getDevice(nativeId: string): Promise<AbbDoorbell | AbbStreamingSwitch> {
         if (nativeId === STREAMING_SWITCH_NATIVE_ID)
             return this.streamingSwitch;
@@ -741,6 +762,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
 
     async syncDevice(): Promise<void> {
         const configuredName = this.getSetting('deviceName');
+        const needsRefresh = this.storage.getItem('deviceRefreshVersion') !== DEVICE_REFRESH_VERSION;
         let config: AutoConfig | undefined;
         try {
             if (this.getSetting('haBaseUrl') && this.getSetting('haToken'))
@@ -765,6 +787,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 name,
                 type: ScryptedDeviceType.Doorbell,
                 interfaces: this.doorbellInterfaces(nativeId),
+                refresh: needsRefresh,
                 info: {
                     manufacturer: 'ABB',
                     model: 'Welcome via Home Assistant',
@@ -781,6 +804,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 name: configuredName || 'Front Door',
                 type: ScryptedDeviceType.Doorbell,
                 interfaces: this.doorbellInterfaces(NATIVE_ID),
+                refresh: needsRefresh,
                 info: {
                     manufacturer: 'ABB',
                     model: 'Welcome via Home Assistant',
@@ -797,6 +821,7 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 interfaces: [
                     ScryptedInterface.OnOff,
                 ],
+                refresh: needsRefresh,
                 info: {
                     manufacturer: 'ABB',
                     model: 'Welcome via Home Assistant',
@@ -810,6 +835,8 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         await sdk.deviceManager.onDevicesChanged({
             devices,
         });
+        if (needsRefresh)
+            this.storage.setItem('deviceRefreshVersion', DEVICE_REFRESH_VERSION);
         for (const device of devices)
             this.updateVisibleDeviceName(device.nativeId, device.name);
     }
@@ -995,7 +1022,7 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
 
     private streamOptions(): ResponseMediaStreamOptions {
         return {
-            id: 'main',
+            id: `main-${this.doorNativeId}`,
             name: this.provider.deviceName(this.doorNativeId),
             container: 'rtsp',
             tool: 'ffmpeg',
@@ -1068,8 +1095,8 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
         return [
             {
-                id: 'latest',
-                name: 'Latest Doorbell Screenshot',
+                id: `latest-${this.doorNativeId}`,
+                name: `${this.provider.deviceName(this.doorNativeId)} Snapshot`,
                 picture: {
                     width: 640,
                     height: 480,
@@ -1082,8 +1109,8 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
 
     async takePicture(_options?: RequestPictureOptions): Promise<MediaObject> {
         const config = await this.provider.getResolvedConfigForNativeId(this.doorNativeId);
-        const image = await this.fetchHaEntityPicture(config.imageEntityId)
-            || await this.fetchHaEntityPicture(config.cameraEntityId)
+        const image = await this.fetchHaEntityPicture(config.cameraEntityId)
+            || await this.fetchHaEntityPicture(config.imageEntityId)
             || FALLBACK_JPEG;
         return sdk.mediaManager.createMediaObject(image, 'image/jpeg', {
             sourceId: this.id,
