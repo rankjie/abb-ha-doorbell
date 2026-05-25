@@ -23,6 +23,9 @@ Each Scrypted doorbell device provides:
 - `Intercom`: receives HomeKit/Scrypted microphone audio, converts it to 8 kHz mono PCM16LE, and sends it to the HA talkback services.
 
 The Home Assistant integration remains responsible for SIP, RTP, RTSP, and door-opening logic.
+Multiple HomeKit viewers attach to the same HA station stream; microphone
+audio is tagged with a per-client session id so stale clients cannot stop a
+newer talkback session.
 
 ## Configuration
 
@@ -61,7 +64,17 @@ mode for that doorbell. ABB Welcome streams use PCMA/G.711 audio and H.264 RTP
 that HomeKit does not reliably accept as passthrough, so transcoding is required
 for stable live view and audio in the Home app.
 
-The plugin also removes Scrypted Rebroadcast/Prebuffer from ABB doorbells when
-it is present. ABB Welcome streaming is an exclusive, on-demand intercom call;
-prebuffering can keep the building intercom occupied and can delay HomeKit live
-view while it waits for a sync frame.
+Rebroadcast can be used with ABB doorbells when prebuffering is disabled. Keep
+prebuffering off: ABB Welcome streaming is an exclusive, on-demand intercom
+call, and prebuffering can keep the building intercom occupied or delay HomeKit
+live view while it waits for a sync frame.
+
+After the plugin starts or reloads, stream auto-arming is suppressed briefly.
+HomeKit may probe camera streams during plugin reload; those probes should not
+open the ABB intercom call by themselves.
+
+Some Home Hubs can also open a local preview immediately after a doorbell ring.
+If that would occupy the exclusive ABB intercom call, add the hub IPs to
+**Blocked HomeKit Client IPs**. During **Ring Preview Block Window**, local
+HomeKit stream requests from those `destinationId` values are rejected, while
+remote Home app viewing through the same hub is still allowed.

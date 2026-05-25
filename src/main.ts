@@ -20,6 +20,7 @@ import sdk, {
     VideoCamera,
 } from '@scrypted/sdk';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 
 const WebSocket = require('ws');
 
@@ -31,11 +32,28 @@ const HA_DISCOVERY_EVENT = 'abb_welcome_discovery_changed';
 const HA_RING_EVENT = 'abb_welcome_ring';
 const RING_EVENT_DURATION_MS = 30000;
 const HOMEKIT_MIXIN_INTERFACE = 'mixin:@scrypted/homekit';
+const HOMEKIT_DESTINATION_TYPE = '@scrypted/homekit';
 const HOMEKIT_DEBUG_MODE_KEY = 'homekit:debugMode';
 const REQUIRED_HOMEKIT_DEBUG_MODE = ['Transcode Video', 'Transcode Audio'];
 const HOMEKIT_TRANSCODING_ENSURE_DELAY_MS = 5000;
-const REBROADCAST_PLUGIN_ID = '@scrypted/prebuffer-mixin';
-const REBROADCAST_MIXIN_INTERFACE = 'mixin:@scrypted/prebuffer-mixin';
+const STREAM_AUTO_ARM_SUPPRESS_AFTER_START_MS = 30000;
+const DEFAULT_RING_PREVIEW_BLOCK_SECONDS = 45;
+const RTSP_FFMPEG_INPUT_OPTIONS = [
+    '-analyzeduration',
+    '0',
+    '-probesize',
+    '32768',
+    '-fflags',
+    'nobuffer',
+    '-flags',
+    'low_delay',
+    '-reorder_queue_size',
+    '0',
+    '-rtsp_transport',
+    'tcp',
+    '-f',
+    'rtsp',
+];
 const FALLBACK_JPEG = Buffer.from(
     '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Al//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QH//EFBQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8QH//EFBABAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QH//Z',
     'base64',
@@ -52,7 +70,9 @@ type SettingKey =
     | 'ringSensorEntityId'
     | 'stationId'
     | 'pollIntervalMs'
-    | 'talkChunkMs';
+    | 'talkChunkMs'
+    | 'ringPreviewBlockSeconds'
+    | 'blockedHomeKitClientIds';
 
 interface HaState {
     entity_id: string;
@@ -81,6 +101,8 @@ interface DiscoveredCamera {
 
 interface IntercomSession {
     id: number;
+    talkbackSessionId: string;
+    talkbackStarted: boolean;
     process: ChildProcessWithoutNullStreams;
     targetData: Record<string, string>;
     buffer: Buffer;
@@ -179,6 +201,71 @@ function cleanCameraName(name: string): string {
         .trim() || name || 'ABB Door';
 }
 
+function compactRequestMediaStreamOptions(options?: RequestMediaStreamOptions): Record<string, any> {
+    const raw = options as any;
+    if (!raw || typeof raw !== 'object')
+        return {};
+
+    const summary: Record<string, any> = {};
+    for (const key of [
+        'refresh',
+        'id',
+        'name',
+        'container',
+        'tool',
+        'source',
+        'destination',
+        'destinationId',
+        'destinationType',
+        'prebuffer',
+        'prebufferBytes',
+    ]) {
+        const value = raw[key];
+        if (value !== undefined && value !== null)
+            summary[key] = value;
+    }
+
+    for (const key of ['video', 'audio']) {
+        const value = raw[key];
+        if (!value || typeof value !== 'object')
+            continue;
+        summary[key] = {};
+        for (const mediaKey of ['codec', 'profile', 'width', 'height', 'fps', 'sampleRate', 'channel', 'bitRate'])
+            if (value[mediaKey] !== undefined && value[mediaKey] !== null)
+                summary[key][mediaKey] = value[mediaKey];
+    }
+
+    if (raw.route && typeof raw.route === 'object') {
+        summary.route = {};
+        for (const routeKey of ['id', 'name', 'destination', 'destinationId', 'source'])
+            if (raw.route[routeKey] !== undefined && raw.route[routeKey] !== null)
+                summary.route[routeKey] = raw.route[routeKey];
+    }
+
+    if (raw.metadata && typeof raw.metadata === 'object')
+        summary.metadataKeys = Object.keys(raw.metadata).sort();
+
+    summary.optionKeys = Object.keys(raw).sort();
+    return summary;
+}
+
+function isHomeKitStreamRequest(options?: RequestMediaStreamOptions): boolean {
+    const raw = options as any;
+    if (!raw || typeof raw !== 'object')
+        return false;
+    return raw.destinationType === HOMEKIT_DESTINATION_TYPE;
+}
+
+function redactMediaUrl(url: string): string {
+    try {
+        const parsed = new URL(url);
+        return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    }
+    catch {
+        return url.split('?')[0];
+    }
+}
+
 function settingStringArray(value: unknown): string[] {
     value = stateValue(value);
     if (Array.isArray(value))
@@ -196,10 +283,28 @@ function settingStringArray(value: unknown): string[] {
     return [];
 }
 
+function settingList(value: unknown): string[] {
+    if (value === undefined || value === null)
+        return [];
+    return String(value)
+        .split(/[\s,;]+/)
+        .map(item => item.trim())
+        .filter(Boolean);
+}
+
+function normalizeHomeKitClientId(value: unknown): string {
+    return String(value || '').trim().replace(/^::ffff:/, '').toLowerCase();
+}
+
+function streamTimingPrefix(deviceName: string, startedAt: number, step: string): string {
+    return `[${new Date().toISOString()}] stream timing ${deviceName}: ${step} +${Date.now() - startedAt}ms`;
+}
+
 class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, Settings {
     private doorbells = new Map<string, AbbDoorbell>();
     private streamingSwitch = new AbbStreamingSwitch(this, STREAMING_SWITCH_NATIVE_ID);
     private deviceNames = new Map<string, string>();
+    private startedAt = Date.now();
     private pollTimer?: NodeJS.Timeout;
     private lastPollWarning = 0;
     private autoConfig?: AutoConfig;
@@ -247,6 +352,8 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             stationId: '',
             pollIntervalMs: '750',
             talkChunkMs: '100',
+            ringPreviewBlockSeconds: String(DEFAULT_RING_PREVIEW_BLOCK_SECONDS),
+            blockedHomeKitClientIds: '',
         };
         return defaults[key];
     }
@@ -390,6 +497,24 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                 type: 'integer',
                 value: Number(this.getSetting('talkChunkMs')),
                 range: [40, 250],
+            },
+            {
+                key: 'ringPreviewBlockSeconds',
+                title: 'Ring Preview Block Window',
+                group: 'Advanced Overrides',
+                type: 'integer',
+                value: Number(this.getSetting('ringPreviewBlockSeconds')) || DEFAULT_RING_PREVIEW_BLOCK_SECONDS,
+                range: [0, 180],
+                description: 'Seconds after a ring event during which blocked HomeKit clients may not auto-open the intercom stream.',
+            },
+            {
+                key: 'blockedHomeKitClientIds',
+                title: 'Blocked HomeKit Client IPs',
+                group: 'Advanced Overrides',
+                type: 'string',
+                value: this.getSetting('blockedHomeKitClientIds'),
+                placeholder: '192.168.1.50, 192.168.1.51',
+                description: 'Comma-separated HomeKit destinationId values, usually Apple TV/HomePod IPs, to reject during the ring preview window.',
             },
         ];
     }
@@ -773,7 +898,6 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
     private updateVisibleDeviceName(nativeId: string, name: string): void {
         try {
             const state = sdk.deviceManager.getDeviceState(nativeId);
-            state.providedName = name;
             const current = String(state.name || '').trim();
             const globalName = this.getSetting('deviceName').trim() || 'Front Door';
             if (
@@ -882,7 +1006,6 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
 
     private async ensureDoorbellScryptedDefaults(nativeId: string): Promise<void> {
         await this.ensureHomeKitTranscoding(nativeId);
-        await this.ensureNoRebroadcastMixin(nativeId);
     }
 
     private async ensureHomeKitTranscoding(nativeId: string): Promise<void> {
@@ -907,33 +1030,6 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         const next = Array.from(new Set([...REQUIRED_HOMEKIT_DEBUG_MODE, ...current]));
         await device.putSetting(HOMEKIT_DEBUG_MODE_KEY, next);
         this.console.log(`enabled HomeKit video/audio transcoding for ${this.deviceName(nativeId)}`);
-    }
-
-    private async ensureNoRebroadcastMixin(nativeId: string): Promise<void> {
-        const state = sdk.deviceManager.getDeviceState(nativeId);
-        const interfaces = settingStringArray((state as any).interfaces);
-        if (!interfaces.includes(REBROADCAST_MIXIN_INTERFACE))
-            return;
-
-        const device = sdk.systemManager.getDeviceById(stateValue(state.id)) as any;
-        if (!device?.setMixins)
-            return;
-
-        const mixins = settingStringArray((state as any).mixins || device.mixins);
-        const filtered: string[] = [];
-        for (const mixinId of mixins) {
-            const mixinDevice = sdk.systemManager.getDeviceById(mixinId) as any;
-            const pluginId = String(stateValue(mixinDevice?.pluginId) || '');
-            if (pluginId === REBROADCAST_PLUGIN_ID)
-                continue;
-            filtered.push(mixinId);
-        }
-
-        if (filtered.length === mixins.length)
-            return;
-
-        await device.setMixins(filtered);
-        this.console.log(`removed Rebroadcast prebuffer from ${this.deviceName(nativeId)}`);
     }
 
     deviceName(nativeId: string): string {
@@ -1001,11 +1097,47 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         });
     }
 
-    async ensureStreaming(): Promise<void> {
-        const entityId = (await this.getResolvedConfig()).streamingSwitchEntityId;
+    async ensureStreaming(nativeId = NATIVE_ID): Promise<void> {
+        const config = await this.getResolvedConfigForNativeId(nativeId);
+        if (config.stationId) {
+            try {
+                await this.callHaService('abb_welcome', 'arm_streaming', {
+                    station_id: config.stationId,
+                    duration: 180,
+                });
+                return;
+            }
+            catch (e) {
+                this.console.warn(
+                    'targeted HA streaming arm failed, falling back to switch.turn_on',
+                    e,
+                );
+            }
+        }
+
+        const entityId = config.streamingSwitchEntityId;
         if (!entityId)
             throw new Error('ABB Welcome streaming switch was not found in Home Assistant');
         await this.callHaService('switch', 'turn_on', { entity_id: entityId });
+    }
+
+    blockedHomeKitClientIds(): Set<string> {
+        return new Set(
+            settingList(this.getSetting('blockedHomeKitClientIds'))
+                .map(normalizeHomeKitClientId)
+                .filter(Boolean),
+        );
+    }
+
+    ringPreviewBlockMs(): number {
+        return Math.max(0, Number(this.getSetting('ringPreviewBlockSeconds')) || DEFAULT_RING_PREVIEW_BLOCK_SECONDS) * 1000;
+    }
+
+    streamAutoArmSuppressed(): number {
+        return Math.max(
+            0,
+            STREAM_AUTO_ARM_SUPPRESS_AFTER_START_MS - (Date.now() - this.startedAt),
+        );
     }
 
     private restartPolling(): void {
@@ -1073,6 +1205,7 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     private intercom?: IntercomSession;
     private sessionCounter = 0;
     private ringClearTimer?: NodeJS.Timeout;
+    private lastRingAt = 0;
 
     constructor(private provider: AbbDoorbellProvider, private doorNativeId: string) {
         super(doorNativeId);
@@ -1106,6 +1239,7 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     }
 
     triggerRing(durationMs: number): void {
+        this.lastRingAt = Date.now();
         this.updateRingState(true);
         if (this.ringClearTimer)
             clearTimeout(this.ringClearTimer);
@@ -1143,15 +1277,48 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     }
 
     async getVideoStream(_options?: RequestMediaStreamOptions): Promise<MediaObject> {
+        const startedAt = Date.now();
+        const deviceName = this.provider.deviceName(this.doorNativeId);
+        const logStep = (step: string, extra = ''): void => {
+            this.console.log(`${streamTimingPrefix(deviceName, startedAt, step)}${extra ? ` ${extra}` : ''}`);
+        };
+        const requestSummary = compactRequestMediaStreamOptions(_options);
+        this.console.log(
+            `${streamTimingPrefix(deviceName, startedAt, 'request')} options=${JSON.stringify(requestSummary)}`,
+        );
+        this.rejectBlockedHomeKitRingPreview(_options);
+        if (!isHomeKitStreamRequest(_options)) {
+            this.console.warn(
+                `${streamTimingPrefix(deviceName, startedAt, 'blocked')} non-HomeKit stream request`,
+            );
+            throw new Error('ABB Welcome refused a non-HomeKit stream request.');
+        }
+        logStep('refreshAutoConfig:start');
         await this.provider.refreshAutoConfig();
-        await this.provider.ensureStreaming();
+        logStep('refreshAutoConfig:done');
+        if ((_options as any)?.refresh) {
+            this.console.log(
+                `${streamTimingPrefix(deviceName, startedAt, 'skip-arm')} refresh=true`,
+            );
+        }
+        else if (this.provider.streamAutoArmSuppressed()) {
+            this.console.log(
+                `${streamTimingPrefix(deviceName, startedAt, 'skip-arm')} startupSuppressionMs=${this.provider.streamAutoArmSuppressed()}`,
+            );
+        }
+        else {
+            logStep('ensureStreaming:start');
+            await this.provider.ensureStreaming(this.doorNativeId);
+            logStep('ensureStreaming:done');
+        }
 
+        logStep('getRtspUrl:start');
         const rtspUrl = await this.getRtspUrl();
+        logStep('getRtspUrl:done', `url=${redactMediaUrl(rtspUrl)}`);
         const ffmpegInput: FFmpegInput = {
             url: rtspUrl,
             inputArguments: [
-                '-rtsp_transport',
-                'tcp',
+                ...RTSP_FFMPEG_INPUT_OPTIONS,
                 '-i',
                 rtspUrl,
             ],
@@ -1175,9 +1342,45 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
             ],
             mediaStreamOptions: this.streamOptions(),
         };
-        return sdk.mediaManager.createFFmpegMediaObject(ffmpegInput, {
+        logStep('createFFmpegMediaObject:start', `inputArguments=${JSON.stringify(ffmpegInput.inputArguments)}`);
+        const mediaObject = await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput, {
             sourceId: this.id,
         });
+        logStep('createFFmpegMediaObject:done');
+        return mediaObject;
+    }
+
+    private rejectBlockedHomeKitRingPreview(options?: RequestMediaStreamOptions): void {
+        const raw = options as any;
+        if (!raw || raw.destinationType !== HOMEKIT_DESTINATION_TYPE)
+            return;
+
+        const clientId = normalizeHomeKitClientId(raw.destinationId);
+        if (!clientId)
+            return;
+
+        const blockMs = this.provider.ringPreviewBlockMs();
+        if (!blockMs)
+            return;
+
+        const ageMs = Date.now() - this.lastRingAt;
+        if (ageMs < 0 || ageMs > blockMs)
+            return;
+
+        // Remote Home app viewing through a Home Hub can use the hub's
+        // destinationId. Only block local HomeKit clients so remote pickup
+        // remains possible.
+        if (raw.destination !== 'local')
+            return;
+
+        if (!this.provider.blockedHomeKitClientIds().has(clientId))
+            return;
+
+        this.console.warn(
+            `blocked HomeKit ring preview for ${this.provider.deviceName(this.doorNativeId)} from ${clientId} ` +
+            `(destination=${raw.destination}, ringAgeMs=${ageMs})`,
+        );
+        throw new Error(`ABB Welcome HomeKit preview blocked for ${clientId}`);
     }
 
     private async getRtspUrl(): Promise<string> {
@@ -1236,10 +1439,16 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
     async startIntercom(media: MediaObject): Promise<void> {
         await this.stopIntercom();
 
+        const talkbackSessionId = randomUUID();
         const session: IntercomSession = {
             id: ++this.sessionCounter,
+            talkbackSessionId,
+            talkbackStarted: false,
             process: undefined as any,
-            targetData: await this.provider.targetData(this.doorNativeId),
+            targetData: {
+                ...await this.provider.targetData(this.doorNativeId),
+                talkback_session_id: talkbackSessionId,
+            },
             buffer: Buffer.alloc(0),
             queue: [],
             sending: false,
@@ -1247,52 +1456,130 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
             stderr: '',
         };
 
-        await this.startHaTalkbackWithRetry(session.targetData);
-
-        let inputUrl: string;
         try {
-            inputUrl = await sdk.mediaManager.convertMediaObjectToLocalUrl(media, ScryptedMimeTypes.LocalUrl);
+            const inputArguments = await this.getIntercomFfmpegInputArguments(media, talkbackSessionId);
+
+            const ffmpeg = await sdk.mediaManager.getFFmpegPath();
+            session.process = spawn(ffmpeg, [
+                '-hide_banner',
+                '-loglevel',
+                'warning',
+                '-nostdin',
+                ...inputArguments,
+                '-vn',
+                '-ac',
+                '1',
+                '-ar',
+                '8000',
+                '-acodec',
+                'pcm_s16le',
+                '-f',
+                's16le',
+                'pipe:1',
+            ]);
         }
         catch (e) {
-            this.console.warn('secure local mic URL conversion failed; trying insecure local URL', e);
-            inputUrl = await sdk.mediaManager.convertMediaObjectToInsecureLocalUrl(media, ScryptedMimeTypes.InsecureLocalUrl);
+            throw e;
         }
 
-        const ffmpeg = await sdk.mediaManager.getFFmpegPath();
-        session.process = spawn(ffmpeg, [
-            '-hide_banner',
-            '-loglevel',
-            'warning',
-            '-nostdin',
-            '-i',
-            inputUrl,
-            '-vn',
-            '-ac',
-            '1',
-            '-ar',
-            '8000',
-            '-acodec',
-            'pcm_s16le',
-            '-f',
-            's16le',
-            'pipe:1',
-        ]);
-
         this.intercom = session;
-        this.console.log('started ABB HA intercom session');
+        this.console.log(`started ABB HA intercom session ${session.talkbackSessionId}`);
 
         session.process.stdout.on('data', chunk => this.enqueuePcm(session, chunk));
         session.process.stderr.on('data', chunk => {
             session.stderr = (session.stderr + chunk.toString()).slice(-1000);
         });
-        session.process.on('close', code => {
+        session.process.on('close', (code, signal) => {
             if (this.intercom === session)
                 this.intercom = undefined;
-            if (!session.stopped)
-                this.console.warn(`intercom ffmpeg exited code=${code} ${session.stderr}`);
-            this.provider.callHaService('abb_welcome', 'talk_stop', session.targetData)
-                .catch(e => this.console.warn('HA talk_stop after ffmpeg close failed', e));
+            const detail = session.stderr ? ` ${session.stderr}` : '';
+            if (!session.stopped || code)
+                this.console.warn(`intercom ffmpeg exited code=${code} signal=${signal || ''}${detail}`);
+            if (session.talkbackStarted) {
+                this.provider.callHaService('abb_welcome', 'talk_stop', session.targetData)
+                    .catch(e => this.console.warn('HA talk_stop after ffmpeg close failed', e));
+            }
         });
+    }
+
+    private async getIntercomFfmpegInputArguments(media: MediaObject, talkbackSessionId: string): Promise<string[]> {
+        this.console.log(
+            `intercom media for ABB HA session ${talkbackSessionId}: ${JSON.stringify({
+                mimeType: media?.mimeType,
+                sourceId: media?.sourceId,
+                toMimeTypes: media?.toMimeTypes,
+            })}`,
+        );
+
+        let lastError: unknown;
+        try {
+            const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
+            const inputArguments = ffmpegInput.inputArguments?.length
+                ? [...ffmpegInput.inputArguments]
+                : ffmpegInput.url
+                    ? ['-i', ffmpegInput.url]
+                    : [];
+            if (inputArguments.length) {
+                this.console.log(
+                    `using FFmpegInput mic source for ABB HA intercom session ${talkbackSessionId}: ${JSON.stringify({
+                        hasUrl: !!ffmpegInput.url,
+                        inputArgumentCount: inputArguments.length,
+                        container: ffmpegInput.container,
+                    })}`,
+                );
+                return inputArguments;
+            }
+        }
+        catch (e) {
+            lastError = e;
+            this.console.warn('FFmpegInput mic conversion failed; trying local mic URL', e);
+        }
+
+        try {
+            if (media?.convert) {
+                const ffmpegInput = await media.convert<FFmpegInput>(ScryptedMimeTypes.FFmpegInput);
+                const inputArguments = ffmpegInput.inputArguments?.length
+                    ? [...ffmpegInput.inputArguments]
+                    : ffmpegInput.url
+                        ? ['-i', ffmpegInput.url]
+                        : [];
+                if (inputArguments.length) {
+                    this.console.log(
+                        `using MediaObject.convert FFmpegInput mic source for ABB HA intercom session ${talkbackSessionId}: ${JSON.stringify({
+                            hasUrl: !!ffmpegInput.url,
+                            inputArgumentCount: inputArguments.length,
+                            container: ffmpegInput.container,
+                        })}`,
+                    );
+                    return inputArguments;
+                }
+            }
+        }
+        catch (e) {
+            lastError = e;
+            this.console.warn('MediaObject FFmpegInput mic conversion failed; trying local mic URL', e);
+        }
+
+        const fallbackMimeType = media?.mimeType || 'audio/basic';
+
+        try {
+            const inputUrl = await sdk.mediaManager.convertMediaObjectToInsecureLocalUrl(media, fallbackMimeType);
+            this.console.log(`using insecure local mic URL for ABB HA intercom session ${talkbackSessionId}: ${redactMediaUrl(inputUrl)}`);
+            return ['-i', inputUrl];
+        }
+        catch (e) {
+            lastError = e;
+            this.console.warn('insecure local mic URL conversion failed; trying secure local URL', e);
+        }
+
+        try {
+            const inputUrl = await sdk.mediaManager.convertMediaObjectToLocalUrl(media, fallbackMimeType);
+            this.console.log(`using secure local mic URL for ABB HA intercom session ${talkbackSessionId}: ${redactMediaUrl(inputUrl)}`);
+            return ['-i', inputUrl];
+        }
+        catch (e) {
+            throw lastError || e;
+        }
     }
 
     async stopIntercom(): Promise<void> {
@@ -1302,8 +1589,11 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
         this.intercom = undefined;
         session.stopped = true;
         session.process.kill('SIGTERM');
-        await this.provider.callHaService('abb_welcome', 'talk_stop', session.targetData)
-            .catch(e => this.console.warn('HA talk_stop failed', e));
+        if (session.talkbackStarted) {
+            session.talkbackStarted = false;
+            await this.provider.callHaService('abb_welcome', 'talk_stop', session.targetData)
+                .catch(e => this.console.warn('HA talk_stop failed', e));
+        }
     }
 
     private async startHaTalkbackWithRetry(targetData: Record<string, string>): Promise<void> {
@@ -1349,6 +1639,11 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
                 const pcm = session.queue.shift();
                 if (!pcm)
                     continue;
+                if (!session.talkbackStarted) {
+                    await this.startHaTalkbackWithRetry(session.targetData);
+                    session.talkbackStarted = true;
+                    this.console.log(`ABB HA intercom session ${session.talkbackSessionId} started after first PCM`);
+                }
                 await this.provider.callHaService('abb_welcome', 'talk_pcm16le', {
                     ...session.targetData,
                     pcm16le: pcm.toString('base64'),
