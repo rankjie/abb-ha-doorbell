@@ -7,6 +7,10 @@ entity discovered in Home Assistant. The legacy `front-door` native id is kept
 for the primary/first station so existing HomeKit pairings do not get replaced.
 Additional stations are added as separate Scrypted child devices.
 
+The plugin also exposes a `Streaming Enabled` switch child device that maps to
+the Home Assistant ABB Welcome streaming switch. Turn it on from Scrypted or
+HomeKit when you want to manually arm streaming for testing.
+
 Each Scrypted doorbell device provides:
 
 - `VideoCamera`: returns the HA-provided RTSP stream.

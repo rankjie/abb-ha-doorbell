@@ -5,6 +5,7 @@ import sdk, {
     FFmpegInput,
     Intercom,
     MediaObject,
+    OnOff,
     RequestMediaStreamOptions,
     RequestPictureOptions,
     ResponseMediaStreamOptions,
@@ -23,6 +24,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 const WebSocket = require('ws');
 
 const NATIVE_ID = 'front-door';
+const STREAMING_SWITCH_NATIVE_ID = 'streaming-enabled';
 const AUTO_DISCOVERY_TTL_MS = 30_000;
 const HA_DISCOVERY_EVENT = 'abb_welcome_discovery_changed';
 const HA_RING_EVENT = 'abb_welcome_ring';
@@ -158,12 +160,14 @@ function cameraNativeId(camera: DiscoveredCamera, primaryEntityId: string): stri
 function cleanCameraName(name: string): string {
     return name
         .replace(/^ABB Welcome\s*/i, '')
+        .replace(/^GATEWAY\s*/i, '')
         .replace(/\s+Camera$/i, '')
         .trim() || name || 'ABB Door';
 }
 
 class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, Settings {
     private doorbells = new Map<string, AbbDoorbell>();
+    private streamingSwitch = new AbbStreamingSwitch(this, STREAMING_SWITCH_NATIVE_ID);
     private deviceNames = new Map<string, string>();
     private pollTimer?: NodeJS.Timeout;
     private lastPollWarning = 0;
@@ -692,11 +696,15 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         return states.find(predicate);
     }
 
-    async getDevice(nativeId: string): Promise<AbbDoorbell> {
+    async getDevice(nativeId: string): Promise<AbbDoorbell | AbbStreamingSwitch> {
+        if (nativeId === STREAMING_SWITCH_NATIVE_ID)
+            return this.streamingSwitch;
         return this.deviceForNativeId(nativeId);
     }
 
     async releaseDevice(_id: string, _nativeId: string): Promise<void> {
+        if (_nativeId === STREAMING_SWITCH_NATIVE_ID)
+            return;
         await this.deviceForNativeId(_nativeId).stopIntercom();
     }
 
@@ -760,6 +768,24 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
                     ip: normalizeBaseUrl(this.getSetting('haBaseUrl')).replace(/^https?:\/\//, ''),
                 },
             });
+        }
+
+        if (config?.streamingSwitchEntityId) {
+            devices.push({
+                nativeId: STREAMING_SWITCH_NATIVE_ID,
+                name: 'Streaming Enabled',
+                type: ScryptedDeviceType.Switch,
+                interfaces: [
+                    ScryptedInterface.OnOff,
+                ],
+                info: {
+                    manufacturer: 'ABB',
+                    model: 'Welcome via Home Assistant',
+                    ip: normalizeBaseUrl(this.getSetting('haBaseUrl')).replace(/^https?:\/\//, ''),
+                },
+            });
+            this.streamingSwitch.refreshState()
+                .catch(e => this.console.warn('streaming switch state refresh failed', e));
         }
 
         await sdk.deviceManager.onDevicesChanged({
@@ -866,6 +892,37 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         const state = await this.callHa(`/api/states/${encodeURIComponent(entityId)}`);
         const next = state?.state === 'on';
         this.deviceForNativeId(NATIVE_ID).updateRingState(next);
+    }
+}
+
+class AbbStreamingSwitch extends ScryptedDeviceBase implements OnOff {
+    constructor(private provider: AbbDoorbellProvider, nativeId: string) {
+        super(nativeId);
+    }
+
+    private async entityId(): Promise<string> {
+        const entityId = (await this.provider.getResolvedConfig()).streamingSwitchEntityId;
+        if (!entityId)
+            throw new Error('ABB Welcome streaming switch was not found in Home Assistant');
+        return entityId;
+    }
+
+    async refreshState(): Promise<void> {
+        const entityId = await this.entityId();
+        const state = await this.provider.callHa(`/api/states/${encodeURIComponent(entityId)}`);
+        this.on = state?.state === 'on';
+    }
+
+    async turnOn(): Promise<void> {
+        const entityId = await this.entityId();
+        await this.provider.callHaService('switch', 'turn_on', { entity_id: entityId });
+        this.on = true;
+    }
+
+    async turnOff(): Promise<void> {
+        const entityId = await this.entityId();
+        await this.provider.callHaService('switch', 'turn_off', { entity_id: entityId });
+        this.on = false;
     }
 }
 
