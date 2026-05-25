@@ -43,7 +43,7 @@ HomeKit when you want to manually arm streaming for testing.
 
 The plugin automatically discovers the ABB camera entities, snapshot image
 entity, streaming switch, ring sensor, station ids, and HA `lan_rtsp_url`.
-Only the primary `front-door` child exposes the global plugin settings;
+Only the first/primary door station exposes the global plugin settings;
 secondary stations use the same settings but do not show the settings panel.
 
 ## HomeKit settings
