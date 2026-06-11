@@ -98,6 +98,9 @@ it does not subscribe to every Home Assistant entity.
 For Apple TV/Home Hub homes, do not enable Scrypted Rebroadcast for these ABB
 doorbells.
 
+The plugin removes Scrypted's Rebroadcast/Prebuffer mixin from ABB doorbells
+during device sync. HomeKit, Snapshot, and WebRTC mixins are left intact.
+
 For homes without a Home Hub, Rebroadcast can be used only if prebuffering is
 disabled. In most setups it is simpler to leave Rebroadcast off. ABB Welcome is
 an exclusive, on-demand intercom call, and prebuffering can keep the building

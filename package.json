@@ -1,6 +1,6 @@
 {
   "name": "@rankjie/abb-ha-doorbell",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "ABB Welcome doorbell bridge for Scrypted via Home Assistant",
   "keywords": [
     "scrypted",

@@ -33,6 +33,7 @@ const HA_RING_EVENT = 'abb_welcome_ring';
 const RING_EVENT_DURATION_MS = 30000;
 const HOMEKIT_MIXIN_INTERFACE = 'mixin:@scrypted/homekit';
 const HOMEKIT_DESTINATION_TYPE = '@scrypted/homekit';
+const PREBUFFER_MIXIN_PLUGIN_ID = '@scrypted/prebuffer-mixin';
 const HOMEKIT_DEBUG_MODE_KEY = 'homekit:debugMode';
 const REQUIRED_HOMEKIT_DEBUG_MODE = ['Transcode Video', 'Transcode Audio'];
 const HOMEKIT_TRANSCODING_ENSURE_DELAY_MS = 5000;
@@ -1047,7 +1048,35 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
     }
 
     private async ensureDoorbellScryptedDefaults(nativeId: string): Promise<void> {
+        await this.ensurePrebufferDisabled(nativeId);
         await this.ensureHomeKitTranscoding(nativeId);
+    }
+
+    private async ensurePrebufferDisabled(nativeId: string): Promise<void> {
+        const state = sdk.deviceManager.getDeviceState(nativeId);
+        const mixins = settingStringArray((state as any).mixins);
+        if (!mixins.length)
+            return;
+
+        const nextMixins: string[] = [];
+        let removed = false;
+        for (const mixinId of mixins) {
+            const mixinDevice = sdk.systemManager.getDeviceById(mixinId) as any;
+            if (stateValue(mixinDevice?.pluginId) === PREBUFFER_MIXIN_PLUGIN_ID) {
+                removed = true;
+                continue;
+            }
+            nextMixins.push(mixinId);
+        }
+        if (!removed)
+            return;
+
+        const deviceId = stateValue((state as any).id);
+        const device = sdk.systemManager.getDeviceById(deviceId) as any;
+        if (!device?.setMixins)
+            throw new Error(`Scrypted device ${nativeId} does not support mixin updates`);
+        await device.setMixins(nextMixins);
+        this.console.warn(`disabled Scrypted Rebroadcast/Prebuffer for ${this.deviceName(nativeId)}`);
     }
 
     private async ensureHomeKitTranscoding(nativeId: string): Promise<void> {
