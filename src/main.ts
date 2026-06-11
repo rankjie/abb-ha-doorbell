@@ -1349,9 +1349,21 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
             );
             throw new Error('ABB Welcome refused a non-HomeKit stream request.');
         }
-        logStep('refreshAutoConfig:start');
-        await this.provider.refreshAutoConfig();
-        logStep('refreshAutoConfig:done');
+        // Discovery is event-driven: the HA integration fires
+        // abb_welcome_discovery_changed (handled over the websocket) whenever
+        // the LAN RTSP URL or door topology changes, which clears this cache.
+        // So only pay for a full /api/states refresh when we don't already
+        // hold a usable stream URL — that keeps doorbell pickup fast on the
+        // common warm-cache path instead of dumping every HA entity each time.
+        const cachedConfig = await this.provider.getResolvedConfigForNativeId(this.doorNativeId);
+        if (isValidRtspUrl(cachedConfig.rtspUrl)) {
+            logStep('refreshAutoConfig:skip-cached');
+        }
+        else {
+            logStep('refreshAutoConfig:start');
+            await this.provider.refreshAutoConfig();
+            logStep('refreshAutoConfig:done');
+        }
         if ((_options as any)?.refresh) {
             this.console.log(
                 `${streamTimingPrefix(deviceName, startedAt, 'skip-arm')} refresh=true`,

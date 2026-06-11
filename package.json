@@ -1,13 +1,30 @@
 {
   "name": "@rankjie/abb-ha-doorbell",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "ABB Welcome doorbell bridge for Scrypted via Home Assistant",
+  "keywords": [
+    "scrypted",
+    "plugin",
+    "abb",
+    "doorbell",
+    "camera",
+    "homekit",
+    "home-assistant"
+  ],
+  "homepage": "https://github.com/rankjie/abb-ha-doorbell#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rankjie/abb-ha-doorbell.git"
+  },
+  "license": "MIT",
   "main": "src/main.ts",
   "exports": {
     "./src/main.ts": "./main.nodejs.js"
   },
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "npm run typecheck && scrypted-webpack",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && NODE_ENV=production scrypted-webpack",
     "scrypted-webpack": "scrypted-webpack",
     "scrypted-deploy": "scrypted-deploy"
   },
