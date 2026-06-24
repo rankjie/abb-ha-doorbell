@@ -28,6 +28,7 @@ const NATIVE_ID = 'front-door';
 const STREAMING_SWITCH_NATIVE_ID = 'streaming-enabled';
 const AUTO_DISCOVERY_TTL_MS = 30_000;
 const DEVICE_REFRESH_VERSION = '2026-05-25-multi-station-media-ids';
+const LAST_DISCOVERED_CONFIG_STORAGE_KEY = 'lastDiscoveredConfig';
 const HA_DISCOVERY_EVENT = 'abb_welcome_discovery_changed';
 const HA_RING_EVENT = 'abb_welcome_ring';
 const RING_EVENT_DURATION_MS = 30000;
@@ -194,6 +195,31 @@ function cameraNativeId(camera: DiscoveredCamera, primaryEntityId: string): stri
     if (camera.stationId)
         return `station-${nativeIdSlug(camera.stationId)}`;
     return `entity-${nativeIdSlug(camera.entityId)}`;
+}
+
+function isStoredDiscoveredCamera(value: any): value is DiscoveredCamera {
+    if (!value || typeof value !== 'object')
+        return false;
+    return typeof value.entityId === 'string'
+        && typeof value.name === 'string'
+        && typeof value.stationId === 'string'
+        && typeof value.rtspUrl === 'string'
+        && typeof value.imageEntityId === 'string';
+}
+
+function isStoredAutoConfig(value: any): value is AutoConfig {
+    if (!value || typeof value !== 'object')
+        return false;
+    return typeof value.cameraEntityId === 'string'
+        && typeof value.imageEntityId === 'string'
+        && typeof value.streamingSwitchEntityId === 'string'
+        && typeof value.ringSensorEntityId === 'string'
+        && typeof value.stationId === 'string'
+        && typeof value.rtspUrl === 'string'
+        && Array.isArray(value.cameras)
+        && value.cameras.length > 0
+        && value.cameras.every(isStoredDiscoveredCamera)
+        && typeof value.summary === 'string';
 }
 
 function cleanCameraName(name: string): string {
@@ -612,12 +638,35 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
             .then(config => {
                 this.autoConfig = config;
                 this.autoConfigExpires = Date.now() + AUTO_DISCOVERY_TTL_MS;
+                this.saveLastGoodAutoConfig(config);
                 return config;
             })
             .finally(() => {
                 this.autoConfigPromise = undefined;
             });
         return this.autoConfigPromise;
+    }
+
+    private saveLastGoodAutoConfig(config: AutoConfig): void {
+        if (!config.cameras.length)
+            return;
+        this.storage.setItem(LAST_DISCOVERED_CONFIG_STORAGE_KEY, JSON.stringify(config));
+    }
+
+    private getLastGoodAutoConfig(): AutoConfig | undefined {
+        const raw = this.storage.getItem(LAST_DISCOVERED_CONFIG_STORAGE_KEY);
+        if (!raw)
+            return undefined;
+        try {
+            const parsed = JSON.parse(raw);
+            if (isStoredAutoConfig(parsed))
+                return parsed;
+            this.console.warn('stored ABB discovery cache is invalid; ignoring it');
+        }
+        catch (e) {
+            this.console.warn('stored ABB discovery cache could not be parsed; ignoring it', e);
+        }
+        return undefined;
     }
 
     async refreshAutoConfig(): Promise<AutoConfig> {
@@ -966,6 +1015,13 @@ class AbbDoorbellProvider extends ScryptedDeviceBase implements DeviceProvider, 
         }
         catch (e) {
             this.console.warn('device discovery sync failed', e);
+            config = this.getLastGoodAutoConfig();
+            if (config) {
+                this.console.warn(
+                    `using cached ABB discovery with ${config.cameras.length} camera(s) ` +
+                    'to preserve Scrypted device identities until Home Assistant discovery recovers',
+                );
+            }
         }
 
         this.deviceNames.clear();
