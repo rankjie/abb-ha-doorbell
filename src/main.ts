@@ -1560,7 +1560,10 @@ class AbbDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Int
 
     async takePicture(_options?: RequestPictureOptions): Promise<MediaObject> {
         const config = await this.provider.getResolvedConfigForNativeId(this.doorNativeId);
-        const image = await this.fetchHaEntityPicture(config.cameraEntityId)
+        // The auto-discovered image may belong to another station; only use an explicit override.
+        const imageEntityId = this.provider.getSetting('imageEntityId').trim();
+        const image = (imageEntityId && await this.fetchHaEntityPicture(imageEntityId))
+            || await this.fetchHaEntityPicture(config.cameraEntityId)
             || FALLBACK_JPEG;
         return sdk.mediaManager.createMediaObject(image, 'image/jpeg', {
             sourceId: this.id,

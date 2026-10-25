@@ -1,6 +1,6 @@
 {
   "name": "@rankjie/abb-ha-doorbell",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "ABB Welcome doorbell bridge for Scrypted via Home Assistant",
   "keywords": [
     "scrypted",
@@ -23,6 +23,7 @@
   },
   "scripts": {
     "build": "npm run typecheck && scrypted-webpack",
+    "test": "node --test tests/*.test.cjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && NODE_ENV=production scrypted-webpack",
     "scrypted-webpack": "scrypted-webpack",

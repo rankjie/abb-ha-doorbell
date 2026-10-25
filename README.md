@@ -46,6 +46,13 @@ entity, streaming switch, ring sensor, station ids, and HA `lan_rtsp_url`.
 Only the first/primary door station exposes the global plugin settings;
 secondary stations use the same settings but do not show the settings panel.
 
+Snapshots read the latest HA event screenshot for each station through its
+camera entity by default. To use an HA image entity instead, set **Snapshot
+Image Entity Override**. This global override applies to all doorbells; if its
+image is unavailable, each doorbell falls back to its own camera snapshot. The
+plugin re-reads the entity's current `entity_picture` URL for every snapshot.
+Leave the override blank to keep station-specific snapshots.
+
 ## HomeKit settings
 
 ABB Welcome streams use PCMA/G.711 audio and H.264 RTP that HomeKit does not
